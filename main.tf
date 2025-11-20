@@ -129,3 +129,27 @@ resource "aws_iam_role_policy_attachment" "lambda_acm" {
   role       = aws_iam_role.cert-manager.name
   policy_arn = "arn:aws:iam::aws:policy/AWSCertificateManagerFullAccess"
 }
+
+resource "aws_cloudwatch_event_rule" "daily_schedule" {
+  name                = "daily-6am-invocation-rule"
+  description         = "Fires daily at 6:00 AM "
+  schedule_expression = var.certificate_renewal_schedule_expression
+}
+
+resource "aws_cloudwatch_event_target" "daily_renewal_check_lambda_event" {
+  rule      = aws_cloudwatch_event_rule.daily_schedule.name
+  target_id = "daily_cert_renwal_check_lambda"
+  arn       = aws_lambda_function.cert-manager.arn
+
+  input = jsonencode({
+    renewal_check = true,
+  })
+}
+
+resource "aws_lambda_permission" "allow_eventbridge" {
+  statement_id  = "AllowExecutionFromEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.cert-manager.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.daily_schedule.arn
+}

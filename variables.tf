@@ -18,3 +18,9 @@ variable "certificate_enrollment_contact_email" {
   type        = string
   description = "Email address to use for enrolled certificates."
 }
+
+variable "certificate_renewal_schedule_expression" {
+  type        = string
+  description = "EventBridge event rule schedule expression"
+  default     = "rate(1 day)"
+}
