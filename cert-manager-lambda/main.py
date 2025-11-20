@@ -19,6 +19,21 @@ certificate_enrollment_email = os.environ['ENROLLMENT_EMAIL_CONTACT']
 dynamodb = boto3.resource('dynamodb')
 secrets_manager = boto3.client('secretsmanager')
 
+def obtain_acme_credentials() -> tuple[str, str]:
+    # Retrieve ACME credentials from Secrets Manager
+    acme_credentials = secrets_manager.get_secret_value(SecretId=acme_credentials_secret_arn)['SecretString']
+    try:
+        acme_credentials = json.loads(acme_credentials)
+    except:
+        print("Error decoding ACME credentials, please check that the secret is formatted correctly")
+        raise
+
+    eab_key_id = acme_credentials['eab_key_id']
+    eab_key = acme_credentials['eab_key']
+
+    return eab_key_id, eab_key
+
+
 def obtain_certificate(domains, email, acme_server, eab_key_id, eab_key):
     print(f"Attempting to obtain a certificate for {domains[0]}...")
 
@@ -86,16 +101,7 @@ def handle_terraform_create(certificate):
     if 'Item' in existing_table_item_response:
         raise Exception(f"Certificate for {common_name} is already managed.")
 
-    # Retrieve ACME credentials from Secrets Manager
-    acme_credentials = secrets_manager.get_secret_value(SecretId=acme_credentials_secret_arn)['SecretString']
-    try:
-        acme_credentials = json.loads(acme_credentials)
-    except:
-        print("Error decoding ACME credentials, please check that the secret is formatted correctly")
-        raise
-
-    eab_key_id = acme_credentials['eab_key_id']
-    eab_key = acme_credentials['eab_key']
+    eab_key_id, eab_key = obtain_acme_credentials()
 
     enrolled_cert_data = obtain_certificate(domains, certificate_enrollment_email, acme_server_url, eab_key_id, eab_key)
 
@@ -150,18 +156,9 @@ def handle_terraform_update(certificate, previous_certificate):
     new_domains = [ domain for domain in domains if not domain in previous_domains ]
     removed_domains = [ domain for domain in previous_domains if not domain in domains ]
 
+    eab_key_id, eab_key = obtain_acme_credentials()
+
     if len(domains) != len(previous_domains):
-        # Retrieve ACME credentials from Secrets Manager
-        acme_credentials = secrets_manager.get_secret_value(SecretId=acme_credentials_secret_arn)['SecretString']
-        try:
-            acme_credentials = json.loads(acme_credentials)
-        except:
-            print("Error decoding ACME credentials, please check that the secret is formatted correctly")
-            raise
-
-        eab_key_id = acme_credentials['eab_key_id']
-        eab_key = acme_credentials['eab_key']
-
         enrolled_cert_data = obtain_certificate(domains, certificate_enrollment_email, acme_server_url, eab_key_id, eab_key)
 
         acm_arns = {}
@@ -211,7 +208,35 @@ def handle_terraform_certificate_request(event):
             raise ValueError(f"Invalid Terraform action: {terraform_action}")
 
 def handle_certificate_renewal_check(event):
-    pass
+    eab_key_id, eab_key = obtain_acme_credentials()
+    cert_table = dynamodb.Table(cert_manager_table_name)
+    table_scan_response = cert_table.scan()
+    if 'Items' in table_scan_response and len(table_scan_response['Items']) > 0:
+        for managed_cert_info in table_scan_response['Items']:
+            first_cert_region, first_cert_arn = list(managed_cert_info['certificate_arns'].items())[0]
+            print(first_cert_arn)
+            acm = boto3.client('acm', region_name=first_cert_region)
+            cert_info = acm.describe_certificate(CertificateArn=first_cert_arn)
+            print(cert_info)
+            now_utc = datetime.datetime.now(timezone.utc)
+            time_difference: datetime.timedelta = cert_info['Certificate']['NotAfter'] - now_utc
+            if time_difference.days <= 10:
+                print(f'Need to renew cert for CN "{managed_cert_info["common_name"]}"')
+                enrolled_cert_data = obtain_certificate(managed_cert_info['domains'], certificate_enrollment_email, acme_server_url, eab_key_id, eab_key)
+                for cert_region, cert_arn in managed_cert_info['certificate_arns'].items():
+                    try:
+                        acm = boto3.client('acm', region_name=cert_region)
+                        acm_response = acm.import_certificate(
+                            CertificateArn=cert_arn,
+                            Certificate=enrolled_cert_data['cert'],
+                            PrivateKey=enrolled_cert_data['key'],
+                            CertificateChain=enrolled_cert_data['chain'],
+                        )
+                        print(f'Updated cert for CN "{managed_cert_info["common_name"]}" in region "{cert_region}"')
+                    except:
+                        print(f'Failed to update cert for CN "{managed_cert_info["common_name"]}" in region "{cert_region}"')
+
+
 
 def handler(event, context):
     event_type = None
